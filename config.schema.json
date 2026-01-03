@@ -1,0 +1,65 @@
+{
+  "pluginAlias": "MoonsideCloud",
+  "pluginType": "platform",
+  "singular": true,
+  "strictValidation": true,
+  "schema": {
+    "type": "object",
+    "required": [
+      "name",
+      "email",
+      "password"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "Moonside Cloud"
+      },
+      "email": {
+        "title": "Moonside Account Email",
+        "type": "string",
+        "format": "email"
+      },
+      "password": {
+        "title": "Moonside Account Password",
+        "type": "string",
+        "format": "password",
+        "password": true
+      },
+      "logLevel": {
+        "title": "Log Level",
+        "type": "string",
+        "default": "warning",
+        "oneOf": [
+          { "title": "Debug", "const": "debug" },
+          { "title": "Warnings Only", "const": "warning" },
+          { "title": "Errors Only", "const": "none" }
+        ],
+        "description": "Controls how chatty the plugin logs should be. Debug will also show every realtime update payload."
+      },
+      "enablePolling": {
+        "title": "Enable Polling Fallback",
+        "type": "boolean",
+        "default": false,
+        "description": "Use periodic polling in addition to the realtime stream. Only enable if your network blocks the Firebase streaming API."
+      },
+      "pollingInterval": {
+        "title": "Polling Interval (seconds)",
+        "type": "number",
+        "minimum": 5,
+        "default": 60,
+        "description": "How often the accessory should poll the cloud when polling fallback is enabled."
+      },
+      "themeSwitches": {
+        "title": "Theme Switches",
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional list of theme names that should appear as stateless switches on each lamp. The plugin will match the names against the official catalog (e.g., \"Dancing Ocean\")."
+      }
+    }
+  }
+}
