@@ -3,7 +3,7 @@ import { setImmediate } from 'node:timers';
 import { THEME_CATALOG_UUID, THEME_SELECTION_UUID } from '../dist/themeCatalogControl.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import hap from 'hap-nodejs';
@@ -452,4 +452,134 @@ test('a failed catalog request after restart preserves native favorites until di
   assert.ok(favorite.services.includes(fire));
   await fire.getCharacteristic(hap.Characteristic.On).handleSetRequest(true);
   assert.deepEqual(restored.commands, [{ deviceId: 'lamp-a', command: 'TEST.B' }]);
+});
+
+test('theme and color commands keep inferred power through later brightness changes', async t => {
+  const path = await mkdtemp(join(tmpdir(), 'favorite-inferred-power-'));
+  t.after(() => rm(path, { recursive: true, force: true }));
+  const { app } = platform(path, { retainLegacyThemeSwitches: false });
+  await app.registerOrUpdateAccessory('lamp-a', { deviceName: 'Lamp A', on: false });
+  const light = app.accessories.get(hap.uuid.generate('lamp-a')).getService(hap.Service.Lightbulb);
+  const power = light.getCharacteristic(hap.Characteristic.On);
+  const brightness = light.getCharacteristic(hap.Characteristic.Brightness);
+  for (const command of ['THEME01,', 'COLOR255000000', 'PIXEL01,']) {
+    await power.handleSetRequest(false);
+    await app.sendControl('lamp-a', command);
+    assert.equal(await power.handleGetRequest(), true);
+    await brightness.handleSetRequest(45);
+    assert.equal(await power.handleGetRequest(), true, `${command} must remain on after brightness`);
+  }
+  await power.handleSetRequest(false);
+  await brightness.handleSetRequest(30);
+  assert.equal(await power.handleGetRequest(), false, 'brightness alone must not turn an off lamp on');
+  app.apiClient.sendControl = async () => {
+    throw new Error('Disconnected');
+  };
+  await assert.rejects(app.sendControl('lamp-a', 'THEME01,'));
+  assert.equal(await power.handleGetRequest(), false, 'failed theme commands must not change power');
+});
+
+test('equal theme commands retain the selected ID through every control path and cloud echoes', async t => {
+  const path = await mkdtemp(join(tmpdir(), 'favorite-shared-command-'));
+  t.after(() => rm(path, { recursive: true, force: true }));
+  const { app } = platform(path);
+  const shared = themes.map(theme => ({ ...theme, controlData: 'THEME01,' }));
+  await app.registerOrUpdateAccessory('lamp-a', { deviceName: 'Lamp A', on: false });
+  await app.registerOrUpdateThemeAccessory('lamp-a', 'Lamp A', shared);
+  const light = app.accessories.get(hap.uuid.generate('lamp-a')).getService(hap.Service.Lightbulb);
+  const setting = light.characteristics.find(c => c.UUID === THEME_FAVORITES_UUID);
+  await setting.handleSetRequest(encodeFavorites({ version: 1, revision: 0, ids: shared.map(t => themeFavoriteId(t.id)) }));
+  const favorite = app.accessories.get(hap.uuid.generate('lamp-a:theme-favorites'));
+  const switches = favorite.services.filter(s => s.UUID === hap.Service.Switch.UUID)
+    .map(s => s.getCharacteristic(hap.Characteristic.On));
+  const read = () => Promise.all(switches.map(c => c.handleGetRequest()));
+  const select = light.characteristics.find(c => c.UUID === THEME_SELECTION_UUID);
+  await select.handleSetRequest(themeFavoriteId('b'));
+  assert.deepEqual(await read(), [false, true]);
+  const lamp = app.accessoriesByDeviceId.get('lamp-a');
+  lamp.updateFromCloud({ controlData: 'THEME01,' });
+  await light.getCharacteristic(hap.Characteristic.Brightness).handleSetRequest(45);
+  assert.deepEqual(await read(), [false, true]);
+  await switches[0].handleSetRequest(true);
+  assert.deepEqual(await read(), [true, false]);
+  await switches[1].handleSetRequest(true);
+  assert.deepEqual(await read(), [false, true]);
+  const legacy = app.accessories.get(hap.uuid.generate('lamp-a:themes'));
+  await legacy.services.find(s => s.subtype === 'a').getCharacteristic(hap.Characteristic.On).handleSetRequest(true);
+  assert.deepEqual(await read(), [true, false]);
+  await setting.handleSetRequest(encodeFavorites({ version: 1, revision: 1, ids: [themeFavoriteId('b')] }));
+  await select.handleSetRequest(themeFavoriteId('b'));
+  assert.equal(await switches[1].handleGetRequest(), true, 'a later alias works when it is the only favorite');
+  await light.getCharacteristic(hap.Characteristic.On).handleSetRequest(false);
+  await light.getCharacteristic(hap.Characteristic.On).handleSetRequest(true);
+  assert.equal(await switches[1].handleGetRequest(), true);
+  app.apiClient.sendControl = async () => {
+    throw new Error('Disconnected');
+  };
+  await assert.rejects(select.handleSetRequest(themeFavoriteId('a')));
+  assert.equal(await switches[1].handleGetRequest(), true, 'a failed alias selection preserves the current ID');
+});
+
+test('broken favorites for one lamp do not stop discovery, realtime updates or later recovery', async t => {
+  for (const failure of ['malformed', 'unreadable']) {
+    await t.test(failure, async t => {
+      const path = await mkdtemp(join(tmpdir(), 'favorite-damaged-file-'));
+      t.after(() => rm(path, { recursive: true, force: true }));
+      const options = { retainLegacyThemeSwitches: false, themeSwitches: ['Ocean', 'Fire'] };
+      const initial = platform(path, options);
+      await initial.app.registerOrUpdateAccessory('lamp-a', { deviceName: 'Lamp A', on: true });
+      await initial.app.registerOrUpdateThemeAccessory('lamp-a', 'Lamp A', themes);
+      const light = initial.app.accessories.get(hap.uuid.generate('lamp-a')).getService(hap.Service.Lightbulb);
+      const setting = light.characteristics.find(c => c.UUID === THEME_FAVORITES_UUID);
+      const saved = { version: 1, revision: 1, ids: [themeFavoriteId('b')] };
+      await setting.handleSetRequest(encodeFavorites({ ...saved, revision: 0 }));
+      const file = join(path, 'moonside-theme-favorites', `${themeFavoriteId('lamp-a')}.json`);
+      if (failure === 'malformed') {
+        await writeFile(file, '{broken');
+      } else {
+        await rm(file);
+        await mkdir(file);
+      }
+      const restored = platform(path, { ...options, email: 'fixture@example.invalid', password: 'fixture' });
+      for (const original of initial.app.accessories.values()) {
+        const accessory = hap.Accessory.deserialize(hap.Accessory.serialize(original));
+        accessory.context = JSON.parse(JSON.stringify(original.context));
+        restored.app.configureAccessory(accessory);
+      }
+      const favorite = restored.app.accessories.get(hap.uuid.generate('lamp-a:theme-favorites'));
+      const cachedSwitch = favorite.services.find(s => s.subtype === themeFavoriteId('b'));
+      let onUpdate;
+      restored.app.apiClient.fetchDevices = async () => new Map([
+        ['lamp-a', { deviceName: 'Lamp A', on: true }],
+        ['lamp-b', { deviceName: 'Lamp B', on: true }],
+      ]);
+      restored.app.apiClient.fetchThemeLibrary = async () => new Map(themes.map(theme => [theme.name.toLowerCase(), theme]));
+      restored.app.apiClient.subscribeToDeviceUpdates = async callback => {
+        onUpdate = callback;
+        return () => {};
+      };
+      await restored.app.discoverDevices();
+      assert.ok(restored.app.accessories.has(hap.uuid.generate('lamp-b')), 'later lamps must still be discovered');
+      assert.equal(typeof onUpdate, 'function', 'discovery must still start realtime updates');
+      await onUpdate('lamp-a', { brightness: 42 });
+      await onUpdate('lamp-c', { deviceName: 'Lamp C', on: true });
+      assert.ok(restored.app.accessories.has(hap.uuid.generate('lamp-c')));
+      assert.equal(restored.app.accessories.get(favorite.UUID), favorite, 'cached automation targets must survive');
+      const restoredLight = restored.app.accessories.get(hap.uuid.generate('lamp-a')).getService(hap.Service.Lightbulb);
+      await restoredLight.getCharacteristic(hap.Characteristic.On).handleSetRequest(false);
+      const restoredSetting = restoredLight.characteristics.find(c => c.UUID === THEME_FAVORITES_UUID);
+      await assert.rejects(restoredSetting.handleSetRequest(encodeFavorites({ version: 1, revision: 0, ids: [] })));
+      if (failure === 'malformed') {
+        assert.equal(await readFile(file, 'utf8'), '{broken', 'a failed write must preserve the damaged file');
+      } else {
+        await rm(file, { recursive: true });
+      }
+      await writeFile(file, JSON.stringify(saved));
+      await onUpdate('lamp-a', { on: true, controlData: 'TEST.B' });
+      assert.deepEqual(decodeFavorites(await restoredSetting.handleGetRequest()), saved);
+      assert.ok(favorite.services.includes(cachedSwitch));
+      await cachedSwitch.getCharacteristic(hap.Characteristic.On).handleSetRequest(true);
+      assert.equal(restored.commands.at(-1).command, 'TEST.B');
+    });
+  }
 });

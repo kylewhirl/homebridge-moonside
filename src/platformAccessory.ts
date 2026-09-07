@@ -87,14 +87,14 @@ export class MoonsideLampAccessory {
 
   }
 
-  public updateFromCloud(update?: DeviceState) {
+  public updateFromCloud(update?: DeviceState, selectedThemeId?: string) {
     if (!update) {
       return;
     }
 
     this.stateRevision++;
     if (typeof update.controlData === 'string') {
-      this.platform.observeControl?.(this.device.deviceId, update.controlData);
+      this.platform.observeControl?.(this.device.deviceId, update.controlData, selectedThemeId);
     } else if (update.on === false) {
       this.platform.observeControl?.(this.device.deviceId, 'LEDOFF');
     }
@@ -155,6 +155,8 @@ export class MoonsideLampAccessory {
     const on = this.parsePowerState(data);
     const brightness = this.parseBrightness(data);
 
+    // Brightness commands replace controlData, so retain the inferred power state.
+    this.cachedState.on = on;
     this.service.updateCharacteristic(this.platform.Characteristic.On, on);
     this.service.updateCharacteristic(this.platform.Characteristic.Brightness, brightness);
 

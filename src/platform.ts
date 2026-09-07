@@ -286,7 +286,13 @@ export class MoonsideCloudPlatform implements DynamicPlatformPlugin {
     if (themes === undefined) {
       return;
     }
-    await this.syncFavoriteControls(deviceId, deviceName, themes);
+    try {
+      await this.syncFavoriteControls(deviceId, deviceName, themes);
+    } catch (error) {
+      // Keep ordinary controls, cached favorites and other lamps available while settings recover.
+      this.logger.error('Failed to update theme favorites for %s: %s', deviceName,
+        error instanceof Error ? error.message : String(error));
+    }
     const uuid = this.api.hap.uuid.generate(`${deviceId}:themes`);
     const existingAccessory = this.accessories.get(uuid);
     // Existing installations retain legacy automation targets unless explicitly disabled.
@@ -326,8 +332,12 @@ export class MoonsideCloudPlatform implements DynamicPlatformPlugin {
     this.accessories.set(accessory.UUID, accessory);
   }
 
-  public observeControl(deviceId: string, command: string) {
-    const theme = this.configuredThemes.get(deviceId)?.find(item => item.controlData === command);
+  public observeControl(deviceId: string, command: string, selectedThemeId?: string) {
+    const matches = this.configuredThemes.get(deviceId)?.filter(item => item.controlData === command) ?? [];
+    const knownId = selectedThemeId ?? this.lastTheme.get(deviceId);
+    // Cloud echoes contain only the command, which can be shared by multiple themes.
+    const theme = matches.find(item => themeFavoriteId(item.id) === knownId)
+      ?? (matches.length === 1 ? matches[0] : undefined);
     const favorites = this.favoriteAccessories.get(deviceId);
     if (theme) {
       this.lastTheme.set(deviceId, themeFavoriteId(theme.id));
@@ -342,7 +352,7 @@ export class MoonsideCloudPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  public async sendControl(deviceId: string, command: string) {
+  public async sendControl(deviceId: string, command: string, selectedThemeId?: string) {
     if (!isValidDeviceId(deviceId) || !this.apiClient) {
       throw new Error('Lamp is unavailable');
     }
@@ -362,9 +372,9 @@ export class MoonsideCloudPlatform implements DynamicPlatformPlugin {
       }
       await this.apiClient!.sendControl(deviceId, command, remaining);
       if (lamp) {
-        lamp.updateFromCloud({ controlData: command });
+        lamp.updateFromCloud({ controlData: command }, selectedThemeId);
       } else {
-        this.observeControl(deviceId, command);
+        this.observeControl(deviceId, command, selectedThemeId);
       }
     });
     this.controlQueue.set(deviceId, operation);
@@ -388,7 +398,7 @@ export class MoonsideCloudPlatform implements DynamicPlatformPlugin {
   }
 
   public async applyTheme(deviceId: string, theme: ThemeDefinition) {
-    await this.sendControl(deviceId, theme.controlData);
+    await this.sendControl(deviceId, theme.controlData, themeFavoriteId(theme.id));
   }
 
   private async syncFavoriteControls(deviceId: string, deviceName: string, themes: ThemeDefinition[]) {
