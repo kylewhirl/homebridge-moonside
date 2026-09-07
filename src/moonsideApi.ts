@@ -141,7 +141,7 @@ export class MoonsideApiClient {
     }
 
     const payload = await response.json() as Array<{ document?: { name: string; fields?: Record<string, FirestoreField> } }>;
-    const themes = new Map<string, ThemeDefinition>();
+    const definitions = new Map<string, ThemeDefinition>();
 
     for (const entry of payload) {
       const doc = entry.document;
@@ -159,14 +159,39 @@ export class MoonsideApiClient {
       const controlData = this.buildThemeCommand(commandField.stringValue, params);
       const id = doc.name?.split('/').pop() ?? nameField.stringValue;
 
-      const def: ThemeDefinition = {
-        id,
-        name: nameField.stringValue,
-        controlData,
-      };
-      themes.set(nameField.stringValue.toLowerCase(), def);
+      const name = nameField.stringValue.trim().replace(/\s+/g, ' ');
+      if (!id || !name) {
+        continue;
+      }
+      definitions.set(id, { id, name, controlData });
     }
 
+    const groups = new Map<string, ThemeDefinition[]>();
+    for (const definition of definitions.values()) {
+      const key = definition.name.toLowerCase();
+      const group = groups.get(key) ?? [];
+      group.push(definition);
+      groups.set(key, group);
+    }
+
+    const themes = new Map<string, ThemeDefinition>();
+    // Preserve existing bare-name lookups, including the last-record rule.
+    for (const [key, group] of groups) {
+      themes.set(key, group[group.length - 1]);
+    }
+
+    // Qualify by document ID, not a position that can change when another
+    // record disappears. Keep these aliases even when a title becomes unique.
+    const usedNames = new Set(groups.keys());
+    for (const definition of [...definitions.values()].sort((a, b) => a.id.localeCompare(b.id))) {
+      const command = definition.controlData.split('.')[1];
+      let name = `${definition.name} - ${command} (${definition.id})`;
+      while (usedNames.has(name.toLowerCase())) {
+        name += ` (${definition.id})`;
+      }
+      usedNames.add(name.toLowerCase());
+      themes.set(name.toLowerCase(), { ...definition, name });
+    }
     return themes;
   }
 
